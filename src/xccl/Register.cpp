@@ -321,6 +321,10 @@ c10::intrusive_ptr<Work> barrier_XPU(
   return process_group->getBackend(c10::DeviceType::XPU)->barrier(opts);
 }
 
+TORCH_LIBRARY(c10d, m) {
+  m.def("_fused_all_gather_matmul_ipc(Tensor A_shard, Tensor[] Bs, int gather_dim, str group_name, bool return_A) -> (Tensor, Tensor)");
+}
+
 TORCH_LIBRARY_IMPL(c10d, XPU, m) {
   m.impl("send", send_XPU);
   m.impl("recv_", recv_XPU);
@@ -343,6 +347,7 @@ TORCH_LIBRARY_IMPL(c10d, XPU, m) {
   m.impl("alltoall_", alltoall_XPU);
   m.impl("alltoall_base_", alltoall_base_XPU);
   m.impl("barrier", barrier_XPU);
+  m.impl("_fused_all_gather_matmul_ipc", _fused_all_gather_matmul_ipc_XPU);
 }
 } // namespace
 
