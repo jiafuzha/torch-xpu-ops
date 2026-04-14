@@ -70,8 +70,11 @@
 namespace symm
 {
 
+inline constexpr int ALLOC_ALIGNMENT = 64; // 64 bytes alignment for SYCL device allocations
+
 using namespace std;
 
+// ================================env related functions=====================================
 inline string get_first_set_env(initializer_list<const char*> var_names, const char* default_value = "") {
   for (const char* var_name : var_names) {
     const char* value = getenv(var_name);
@@ -115,28 +118,7 @@ inline const string& make_ipc_resource_suffix() {
   return suffix;
 }
 
-sycl::queue create_queue(int rank, int world_size, bool in_order=true) {
-    auto platforms = sycl::platform::get_platforms();
-    for (const auto &platform : platforms) {
-        if (platform.get_backend() == sycl::backend::ext_oneapi_level_zero) {
-          if (platform.get_devices().size() >= world_size) {
-            if (in_order) {
-              return sycl::queue(platform.get_devices()[rank], {sycl::property::queue::in_order{}});
-            } else {
-              return sycl::queue(platform.get_devices()[rank]);
-            }
-          } else {
-            if (in_order) {
-              return sycl::queue({sycl::property::queue::in_order{}});
-            } else {
-              return sycl::queue();
-            }
-          }
-        }
-    }
-    throw runtime_error("Level-Zero platform not found.");
-}
-
+// ================================Unix domain socket functions=====================================
 // Create Unix domain socket server for receiving IPC handles
 int create_server_socket(const string sockname) {
   int status = unlink(sockname.c_str());  // Remove old socket file if exists
@@ -171,19 +153,19 @@ void close_server_socket(const string server_socket_name, int sock_fd) {
   }
 }
 
-void send_fd_no_connection(int socket, const string remote_sockname, int fd, int rank, size_t offset) {
+void send_fd_no_connection(int socket, const string remote_sockname, int fd, int rank, size_t offset, size_t base_size) {
   sockaddr_un addr = {.sun_family = AF_UNIX, .sun_path = ""};
   copy(remote_sockname.begin(), remote_sockname.end(), addr.sun_path);
 
-  auto rank_offset = make_pair(rank, offset);
+  auto rank_offset_basesize = make_tuple(rank, offset, base_size);
 
   // Prepare data to send
-  // Data being sent is "fd", the value of fd will be sent as auxiliary data
-  // (control message)
-  iovec io = {.iov_base = &rank_offset, .iov_len = sizeof(rank_offset)};
+  // data with rank offset
+  iovec io = {.iov_base = &rank_offset_basesize, .iov_len = sizeof(rank_offset_basesize)};
 
   // Prepare control message data buffer and zero it out
   // NOLINTNEXTLINE(*array*)
+  // Data being sent is "fd", the value of fd will be sent as auxiliary data
   char cbuf[CMSG_SPACE(sizeof(int))];
   memset(cbuf, 0, sizeof(cbuf));
 
@@ -250,13 +232,13 @@ void send_fd_no_connection(int socket, const string remote_sockname, int fd, int
       errno);
 }
 
-std::tuple<int, int, size_t> recv_fd_no_connection(int socket, const string remote_sockname) {
-  // Prepare buffer for regular message "fd"
+std::tuple<int, int, size_t, size_t> recv_fd_no_connection(int socket, const string remote_sockname) {
   // NOLINTNEXTLINE(*array*)
-  pair<int, size_t> rank_offset;
-  struct iovec io = {.iov_base = &rank_offset, .iov_len = sizeof(rank_offset)};
+  std::tuple<int, size_t, size_t> rank_offset_basesize;
+  struct iovec io = {.iov_base = &rank_offset_basesize, .iov_len = sizeof(rank_offset_basesize)};
 
   // Prepare buffer for control message and zero it out
+  // Prepare buffer for regular message "fd"
   // NOLINTNEXTLINE(*array*)
   char cbuf[CMSG_SPACE(sizeof(int))];
   memset(cbuf, 0, sizeof(cbuf));
@@ -283,7 +265,7 @@ std::tuple<int, int, size_t> recv_fd_no_connection(int socket, const string remo
       errno);
 
   if (msg.msg_controllen == 0) {
-    return make_tuple(-1, -1, -1);
+    return make_tuple(-1, -1, -1, -1);
   }
 
   // Extract control message and validate its content
@@ -291,7 +273,7 @@ std::tuple<int, int, size_t> recv_fd_no_connection(int socket, const string remo
   COND_CHECK(cmsg != nullptr);
   COND_CHECK(cmsg->cmsg_len == CMSG_LEN(sizeof(int)));
   COND_CHECK(cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS);
-  return make_tuple(*reinterpret_cast<int*>(CMSG_DATA(cmsg)), rank_offset.first, rank_offset.second);
+  return make_tuple(*reinterpret_cast<int*>(CMSG_DATA(cmsg)), get<0>(rank_offset_basesize), get<1>(rank_offset_basesize), get<2>(rank_offset_basesize));
 }
 
 inline void close_fd_if_valid(int fd) {
@@ -311,6 +293,119 @@ inline void unlink_if_exists(const string& path, const string& error_context) {
   }
 }
 
+// ================================sycl allocation=====================================
+
+template <typename T>
+auto make_shared_usm(sycl::queue& Q, const std::vector<int>& shape, bool init_zero = false) {
+  using namespace cute;
+  auto count = std::accumulate(shape.begin(), shape.end(), (size_t)1, std::multiplies<>());
+  void* raw_ptr;
+  raw_ptr = sycl::malloc_shared<T>(count, Q);
+  assert(raw_ptr != nullptr);
+  if (init_zero) {
+    Q.memset(raw_ptr, 0, count * sizeof(T));
+  }
+  return raw_ptr;
+}
+
+template <typename T, char LayoutKind>
+auto make_shared_usm_tensor_init(sycl::queue& Q, const std::vector<int>& shape_vector, bool init_zero = false) {
+  void* raw_ptr = make_shared_usm<T>(Q, shape_vector, init_zero);
+  auto ptr = make_gmem_ptr(static_cast<T*>(raw_ptr));
+  if constexpr (LayoutKind == '-') { // size of shape is 1
+    assert(shape_vector.size() == 1);
+    auto shape = make_shape(shape_vector[0]);
+    return make_tensor(ptr, make_layout(shape, make_stride(_1{})));
+  } else { // size of shape is 2
+    assert(shape_vector.size() == 2);
+    auto r = shape_vector[0];
+    auto c = shape_vector[1];
+    auto shape = make_shape(r, c);
+    if constexpr (LayoutKind == 'C')
+      return make_tensor(ptr, make_layout(shape, make_stride(_1{}, r)));
+    else
+      return make_tensor(ptr, make_layout(shape, make_stride(c, _1{})));
+  }
+}
+
+template <typename T, char LayoutKind>
+auto make_usm_raw_ptr_and_layout(sycl::queue& Q, const std::vector<int>& shape_vector) {
+  void* raw_ptr = make_shared_usm<T>(Q, shape_vector, false);
+  auto ptr = make_gmem_ptr(static_cast<T*>(raw_ptr));
+  if constexpr (LayoutKind == '-') { // size of shape is 1
+    assert(shape_vector.size() == 1);
+    auto shape = make_shape(shape_vector[0]);
+    return std::make_tuple(raw_ptr, make_layout(shape, make_stride(_1{})));
+  } else { // size of shape is 2
+    assert(shape_vector.size() == 2);
+    auto r = shape_vector[0];
+    auto c = shape_vector[1];
+    auto shape = make_shape(r, c);
+    if constexpr (LayoutKind == 'C')
+      return std::make_tuple(raw_ptr, make_layout(shape, make_stride(_1{}, r)));
+    else
+      return std::make_tuple(raw_ptr, make_layout(shape, make_stride(c, _1{})));
+  }
+}
+
+
+template <char LayoutKind>
+auto make_sycl_tla_layout(const int r, const int c) {
+  using namespace cute;
+  if constexpr (LayoutKind == 'C')
+    return make_layout(make_shape(r, c), make_stride(_1{}, r));
+  else
+    return make_layout(make_shape(r, c), make_stride(c, _1{}));
+}
+
+template <typename InTensor>
+void
+free_usm_tensor(InTensor &X, sycl::queue &Q)
+{
+  // RAII? What's that?
+  sycl::free(&*X.data(), Q);
+}
+
+void free_usm(sycl::queue& Q, void* ptr) {
+  sycl::free(ptr, Q);
+}
+
+namespace symm {
+
+template <typename T>
+auto sycl_allocate(sycl::queue& Q, const std::vector<int>& shape) {
+  auto count = std::accumulate(shape.begin(), shape.end(), (size_t)1, std::multiplies<>());
+  T* ptr = sycl::aligned_alloc_device<T>(ALLOC_ALIGNMENT, count, Q);
+  assert(ptr != nullptr);
+  return ptr;
+}
+
+
+template <typename T, char LayoutKind>
+auto make_ipc_symm_raw_ptr_and_layout(sycl::queue& Q, const std::vector<int>& shape_vector) {
+  T* ptr = sycl_allocate<T>(Q, shape_vector);
+  if constexpr (LayoutKind == '-') { // size of shape is 1
+    assert(shape_vector.size() == 1);
+    auto shape = cute::make_shape(shape_vector[0]);
+    return std::make_tuple((void*)ptr, cute::make_layout(shape, cute::make_stride(_1{})));
+  } else { // size of shape is 2
+    assert(shape_vector.size() == 2);
+    auto r = shape_vector[0];
+    auto c = shape_vector[1];
+    auto shape = cute::make_shape(r, c);
+    if constexpr (LayoutKind == 'C')
+      return std::make_tuple((void*)ptr, cute::make_layout(shape, cute::make_stride(_1{}, r)));
+    else
+      return std::make_tuple((void*)ptr, cute::make_layout(shape, cute::make_stride(c, _1{})));
+  }
+}
+
+void sycl_free(void* ptr, sycl::queue& Q) {
+  ipc_symm_free(ptr);
+  sycl::free(ptr, Q);
+}
+
+// ================================barrier and cleanup=====================================
 struct CleanupRegistry {
   int socket_fd = -1;
   int barrier_fd = -1;
@@ -539,6 +634,8 @@ private:
   bool initialized_ = false;
 };
 
+// ================================symmetric memory=====================================
+
 // Union that holds either a raw device pointer or a Level-Zero IPC handle.
 // On Linux the first sizeof(int) bytes of ze_ipc_mem_handle_t encode a file
 // descriptor, so the two representations share the same underlying storage.
@@ -553,6 +650,35 @@ union IpcHandleOrPtr {
     // Convenience: read/write the embedded file descriptor (Linux-specific).
     int  fd() const  { return *reinterpret_cast<const int*>(&ipc_handle); }
     void set_fd(int f) { *reinterpret_cast<int*>(&ipc_handle) = f; }
+};
+
+// block for reusing memory
+class SymmetricBlock {
+public:
+    SymmetricBlock(void* ptr, size_t memory_size, size_t world_size) : ptr_(ptr), memory_size_(memory_size), world_size_(world_size) {
+      remote_infos_.resize(world_size);
+    }
+
+    void* ptr() const { return ptr_; }
+    size_t memory_size() const { return memory_size_; }
+    std::vector<std::tuple<IpcHandleOrPtr, void*, int, size_t>>& get_remote_infos() { return remote_infos_; }
+    void rendezvous() {
+        rendezvous_done_ = true;
+    }
+    bool is_rendezvoused() const {
+        return rendezvous_done_;
+    }
+    void set_remote_info(size_t rank, IpcHandleOrPtr remote_handle_or_ptr, void* remote_ptr, int fd, size_t base_memory_size) {
+        remote_infos_[rank] = std::make_tuple(remote_handle_or_ptr, remote_ptr, fd, base_memory_size);
+    }
+private:
+    void* ptr_;
+    size_t memory_size_;
+    size_t world_size_;
+    volatile bool rendezvous_done_ = false;
+    // local_ptr -> [{remote_ptr1_base, remote_ptr1, fd1, base_memory_size1}, {remote_ptr2_base, remote_ptr2, fd2, base_memory_size2}, ...] (multiple ranks)
+    // local_ptr -> [local_rank]=> {local_ipc_handle, local_base_ptr, fd, base_memory_size} (for local rank)
+    vector<std::tuple<IpcHandleOrPtr, void*, int, size_t>> remote_infos_;
 };
 
 // single instance class to manage symmetric shared memory
@@ -609,8 +735,8 @@ public:
         }
         auto l0_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
                       DEFAULT_QUEUE.get_context());
-        auto it = local_to_remote_memory_ptrs.find(local_ptr);
-        if (it != local_to_remote_memory_ptrs.end()) {
+        auto it = local_to_symmblk.find(local_ptr);
+        if (it != local_to_symmblk.end() && !it->second.is_rendezvoused()) {
             return; // Already rendezvoused, do nothing
         }
         lock_guard<std::mutex> lock(state_mutex); // Ensure only one thread can rendezvous at a time
@@ -620,21 +746,21 @@ public:
         TORCH_CHECK(zeMemGetAddressRange(l0_ctx, local_ptr, &base_addr, &base_size));
         size_t offset = (char*)local_ptr - (char*)base_addr;
 
+        auto l0_device = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(DEFAULT_QUEUE.get_device());
         ze_ipc_mem_handle_t ipc_handle;
         TORCH_CHECK(zeMemGetIpcHandle(l0_ctx, base_addr, &ipc_handle));
+        TORCH_CHECK(zeContextMakeMemoryResident(l0_ctx, l0_device, base_addr, base_size));
 
         int my_fd = *reinterpret_cast<int*>(&ipc_handle);
-        vector<std::tuple<IpcHandleOrPtr, void*, int>> remote_infos(WORLD_SIZE); // remote_base, remote_ptr, fd
-        remote_infos[LOCAL_RANK] = make_tuple(IpcHandleOrPtr(ipc_handle), local_ptr, my_fd); // local rank's own memory info
-
-        auto l0_device = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(DEFAULT_QUEUE.get_device());
+        SymmetricBlock symm_blk(local_ptr, base_size - offset, WORLD_SIZE);
+        symm_blk.set_remote_info(LOCAL_RANK, IpcHandleOrPtr(ipc_handle), base_addr, my_fd, base_size); // local rank's own memory info
 
         // exchange fd, skip local rank
         for (int i = LOCAL_RANK + 1, j = LOCAL_RANK - 1; i < (WORLD_SIZE + LOCAL_RANK); i++, j--) {
             int remote_rank = i % WORLD_SIZE;
-            send_fd_no_connection(socket_fd, SERVER_SOCKET_NAME_PREFIX + to_string(remote_rank), my_fd, LOCAL_RANK, offset);
+            send_fd_no_connection(socket_fd, SERVER_SOCKET_NAME_PREFIX + to_string(remote_rank), my_fd, LOCAL_RANK, offset, base_size);
             int remote_rank_to_receive =  (j + WORLD_SIZE) % WORLD_SIZE;
-            auto [remote_fd, remote_rank_received, remote_offset] = recv_fd_no_connection(socket_fd, SERVER_SOCKET_NAME_PREFIX + to_string(remote_rank_to_receive));
+            auto [remote_fd, remote_rank_received, remote_offset, remote_base_size] = recv_fd_no_connection(socket_fd, SERVER_SOCKET_NAME_PREFIX + to_string(remote_rank_to_receive));
             assert(remote_rank_received == remote_rank_to_receive);
             // open remote IPC handle to get remote base address, then calculate remote pointer with offset
             // Reconstruct IPC handle using the received file descriptor
@@ -646,11 +772,13 @@ public:
             void* remote_base;
             TORCH_CHECK(zeMemOpenIpcHandle(l0_ctx, l0_device, remote_ipc_handle,
                                         ZE_IPC_MEMORY_FLAG_BIAS_CACHED, &remote_base));
+            TORCH_CHECK(zeContextMakeMemoryResident(l0_ctx, l0_device, remote_base, remote_base_size));
 
             float* remote_ptr = (float*)((char*)remote_base + remote_offset);
-            remote_infos[remote_rank_received] = make_tuple(IpcHandleOrPtr(remote_base), remote_ptr, remote_fd);
+            symm_blk.set_remote_info(remote_rank_received, IpcHandleOrPtr(remote_base), remote_ptr, remote_fd, remote_base_size);
         }
-        local_to_remote_memory_ptrs[local_ptr] = remote_infos;
+        symm_blk.rendezvous();
+        local_to_symmblk[local_ptr] = symm_blk;
     }
 
     void* get_remote_ptr(void* local_ptr, int remote_rank) {
@@ -660,11 +788,11 @@ public:
         if (remote_rank == LOCAL_RANK) {
             return local_ptr; // Return local pointer for local rank
         }
-        auto it = local_to_remote_memory_ptrs.find(local_ptr);
-        if (it == local_to_remote_memory_ptrs.end()) {
+        auto it = local_to_symmblk.find(local_ptr);
+        if (it == local_to_symmblk.end()) {
             throw runtime_error("Local pointer not found in rendezvous: " + to_string((uintptr_t)local_ptr));
         }
-        auto& remote_infos = it->second;
+        auto& remote_infos = it->second.get_remote_infos();
         if (remote_rank < 0 || remote_rank >= WORLD_SIZE) {
             throw runtime_error("Invalid remote rank: " + to_string(remote_rank));
         }
@@ -676,17 +804,18 @@ public:
             throw runtime_error("SymmetricSharedMemory must be initialized before free");
         }
         lock_guard<std::mutex> lock(state_mutex); // Ensure only one thread can change internal state at a time
-        auto it = local_to_remote_memory_ptrs.find(local_ptr);
-        if (it != local_to_remote_memory_ptrs.end()) {
+        auto it = local_to_symmblk.find(local_ptr);
+        if (it != local_to_symmblk.end()) {
             auto l0_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
                       DEFAULT_QUEUE.get_context());
-            for (auto& [handle_or_ptr, remote_ptr, fd] : it->second) {
-                release_resources_for_ptr(l0_ctx, local_ptr, handle_or_ptr, remote_ptr, fd);
+            auto l0_device = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(DEFAULT_QUEUE.get_device());
+            for (int i = 0; i < WORLD_SIZE; ++i) {
+                release_resources_for_ptr(l0_ctx, l0_device, local_ptr, it->second.get_remote_infos()[i], i == LOCAL_RANK);
             }
         } else { // if multiple threads call free() on the same pointer, throw exception
             throw runtime_error("SymmetricSharedMemory: free() called on unregistered pointer");
         }
-        local_to_remote_memory_ptrs.erase(it); // Remove the entry from the map
+        local_to_symmblk.erase(it); // Remove the entry from the map
     }
     
     void barrier_all() {
@@ -737,7 +866,7 @@ public:
         LOCAL_RANK = stoi(get_first_set_env({"LOCAL_RANK", "MPI_LOCALRANKID", "OMPI_COMM_WORLD_LOCAL_RANK", "PMI_LOCAL_RANK"}, "0"));
         RANK = stoi(get_first_set_env({"RANK", "OMPI_COMM_WORLD_RANK", "PMI_RANK"}, "0"));
         WORLD_SIZE = stoi(get_first_set_env({"WORLD_SIZE", "OMPI_COMM_WORLD_SIZE", "PMI_SIZE"}, "1"));
-        // TODO: confirm in-order queue
+        // confirmed in-order queue
         DEFAULT_QUEUE = at::xpu::getCurrentXPUStream().queue();
         COMPUTE_QUEUE = sycl::queue(DEFAULT_QUEUE.get_device(), {sycl::property::queue::in_order{}});
         SERVER_SOCKET_NAME_PREFIX = "/tmp/sycl-ipc-symm-server-" + make_ipc_resource_suffix() + "-";
@@ -751,14 +880,18 @@ public:
         do_finalize();
     }
 
-    inline void release_resources_for_ptr(ze_context_handle_t& l0_ctx, void* local_ptr, IpcHandleOrPtr handle_or_ptr, void* remote_ptr, int fd) {
+    inline void release_resources_for_ptr(ze_context_handle_t& l0_ctx, ze_device_handle_t& l0_device, void* local_ptr,
+      std::tuple<IpcHandleOrPtr, void*, int, size_t>& remote_info, bool is_local_rank) {
+        auto& [handle_or_ptr, remote_ptr, fd, base_memory_size] = remote_info;
         if (fd >= 0) {
             close(fd);
         }
-        if (local_ptr != remote_ptr) { // avoid closing local memory handle as remote handle
+        if (!is_local_rank) { // remote rank's memory, close ipc handle
+            ZE_CHECK(zeContextEvictMemory(l0_ctx, l0_device, handle_or_ptr.ptr, base_memory_size));
             ZE_CHECK(zeMemCloseIpcHandle(l0_ctx, handle_or_ptr.ptr));
         } else { // local rank's own memory, put back ipc handle instead of close
-            // remote_base is actually local_ipc_base
+            // remote_ptr is a pointer to the local base memory if it's the local rank
+            ZE_CHECK(zeContextEvictMemory(l0_ctx, l0_device, remote_ptr, base_memory_size));
             ZE_CHECK(zeMemPutIpcHandle(l0_ctx, handle_or_ptr.ipc_handle));
         }
     }
@@ -769,13 +902,15 @@ public:
         }
         auto l0_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
                       DEFAULT_QUEUE.get_context());
-        for (auto& [local_ptr, remote_infos] : local_to_remote_memory_ptrs) {
-            for (auto& [handle_or_ptr, remote_ptr, fd] : remote_infos) {
-                release_resources_for_ptr(l0_ctx, local_ptr, handle_or_ptr, remote_ptr, fd);
+        auto l0_device = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(DEFAULT_QUEUE.get_device());
+        for (auto& [local_ptr, sym_blk] : local_to_symmblk) {
+            for (int i = 0; i < WORLD_SIZE; ++i) {
+                auto& remote_info = sym_blk.get_remote_infos()[i];
+                release_resources_for_ptr(l0_ctx, l0_device, local_ptr, remote_info, i == LOCAL_RANK);
             }
             // local_ptr is to be freed by the user, so no need to free it here
         }
-        local_to_remote_memory_ptrs.clear();
+        local_to_symmblk.clear();
         close_server_socket(server_socket_name, socket_fd);
         socket_fd = -1;
         server_socket_name.clear();
@@ -795,9 +930,8 @@ public:
     const string SERVER_SOCKET_NAME_PREFIX;
     const string BARRIER_FILE_PATH;
 
-    // local_ptr -> [{remote_ptr1_base, remote_ptr1, fd1}, {remote_ptr2_base, remote_ptr2, fd2}, ...] (multiple ranks)
-    // local_ptr -> [local_rank]=> {local_ipc_base, local_ptr, fd} (for local rank)
-    unordered_map<void*, vector<std::tuple<IpcHandleOrPtr, void*, int>>> local_to_remote_memory_ptrs;
+    unordered_map<void*, SymmetricBlock> local_to_symmblk;
+    unordered_map<int64_t, void*> alloc_map;
     string server_socket_name;
     int socket_fd = -1;
     unique_ptr<ProcessBarrier> proc_barrier_ptr;
@@ -806,6 +940,7 @@ public:
     std::mutex state_mutex;
 };
 
+// ================================ipc_symm function wrappers=====================================
 
 void ipc_symm_init() {
   SymmetricSharedMemory& sym = SymmetricSharedMemory::get_instance();
