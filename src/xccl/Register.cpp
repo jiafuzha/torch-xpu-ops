@@ -14,6 +14,8 @@
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/library.h>
 
+#include "xccl/all_gather/allgather_gemm.hpp"
+
 namespace c10d {
 namespace ops {
 namespace {
@@ -319,6 +321,25 @@ c10::intrusive_ptr<Work> barrier_XPU(
   opts.timeout = std::chrono::milliseconds(timeout);
   opts.asyncOp = asyncOp;
   return process_group->getBackend(c10::DeviceType::XPU)->barrier(opts);
+}
+
+std::tuple<at::Tensor, at::Tensor> _fused_all_gather_matmul_ipc_XPU(
+    at::Tensor A_shard,
+    const std::vector<at::Tensor>& Bs,
+    int64_t gather_dim,
+    const std::string& group_name,
+    bool return_A) {
+  // TODO: datatype and layout conversion
+  switch (A_shard.dtype()) {
+    case at::ScalarType::Half:
+      return AllGatherGemm<at::Half>(
+          A_shard, Bs, gather_dim, group_name, return_A);
+    case at::ScalarType::Float:
+      return _fused_all_gather_matmul_ipc_impl<float>(
+          A_shard, Bs, gather_dim, group_name, return_A);
+    default:
+      TORCH_CHECK(false, "Unsupported datatype for _fused_all_gather_matmul_ipc");
+  }
 }
 
 TORCH_LIBRARY(c10d, m) {

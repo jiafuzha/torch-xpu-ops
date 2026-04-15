@@ -213,6 +213,9 @@ class AllGatherGemm {
 
     public:
     static std::unique_ptr<AllGatherGemm> get_instance(int m, int n, int k) {
+        // make sure ipc_symm is initialized
+        symm::ipc_symm_init();
+        // get exising instance or create a new one
         auto key = std::make_tuple(m, n, k);
         lock_guard<std::mutex> lock(mutex); // Ensure only one thread can initialize at a time
         auto it = instance_map.find(key);

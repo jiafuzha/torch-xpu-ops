@@ -922,6 +922,8 @@ public:
 void ipc_symm_init() {
   SymmetricSharedMemory& sym = SymmetricSharedMemory::get_instance();
   sym.initialize();
+  // register cleanup function to be called at program exit
+  std::atexit(ipc_symm_finalize);
 }
 
 void ipc_symm_finalize() {
